@@ -1,5 +1,24 @@
 ## Changelog
 
+#### Version 0.5.1
+ * Renamed to "Modlist and Load Order Backup", and the toolbar buttons are now Restore Modlist, Back Up Modlist (All Games), Back Up Modlist (This Game) and Back Up Modlist and Load Order (This Profile)
+ * Backing up "Only This Profile" also saves the profile's load order to a second file next to the modlist, like vortex-starfield-Default-loadorder-backup-20261026-212500.json. It's the same format as the Export button on Vortex's Load Order page, so you can restore it with that page's Import button
+ * Each toolbar button now has its own icon, instead of all four showing the same eye icon
+ * Backups now default to a file name saying what was backed up and when, like vortex-starfield-modlist-backup-20261026-212500.json
+ * Fixed installing in current versions of Vortex, which rejected the extension because of how its author was listed
+
+#### Version 0.5.0
+ * Backing up all games over an existing backup now replaces it, instead of only updating the game you're managing
+ * Backups now record whether mods are enabled using each game's own profile, so restoring a game no longer disables mods that were backed up while managing a different game
+ * Backups now record which game each mod was installed into, so mods a game uses from another game (like Skyrim mods in Skyrim Special Edition) are backed up and restored with the right game
+ * Backing up asks before replacing an existing file, and won't overwrite a file that isn't a modlist backup
+ * Backups are saved safely, so a crash while saving can't leave a half written backup
+ * Backing up or restoring with no game managed shows an error instead of failing
+ * Choosing "Yes, download and install" when restoring now installs the mods, and you're only asked when there's something new to install
+ * Restoring an unreadable or invalid backup file shows an error instead of failing silently
+ * Mods that fail to download while restoring are reported
+ * The notification after restoring now says how many mods were queued and how many were enabled or disabled
+
 #### Version 0.4.0
  * There's a new option to only backup mods enabled in the current profile
  * Backup files created from now on will contain information on whether or not the mod was enabled in the current active profile

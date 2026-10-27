@@ -20,18 +20,34 @@ export interface Mod {
   source?: string;
   enabled?: boolean;
   vortexId?: string;
+  // The game Vortex installed the mod into. `game` is the game the mod was downloaded for, which can be different
+  // when a game accepts mods from another game, like Skyrim Special Edition accepting Skyrim mods. We still need
+  // `game` to download the mod again. Older backups don't have this
+  installedGame?: string;
 }
+
+// The game a mod from a backup belongs to, falling back to the game it was downloaded for in older backups
+const modGame = (mod: Mod): string => mod.installedGame ?? mod.game;
 
 interface Profile {
   gameId: string;
   id: string;
+  name?: string;
   lastActivated: number;
   modState?: Record<string, { enabled: boolean }>;
 }
 
+// shouldInstall is the user's choice of whether to install the mods once they've downloaded, or only download them.
+// Integrations registered before it was added can ignore it
+type InstallMods = (
+  api: IExtensionApi,
+  mod: Mod[],
+  shouldInstall?: boolean,
+) => void;
+
 interface Integration {
   source: string;
-  installMods: (api: IExtensionApi, mod: Mod[]) => void;
+  installMods: InstallMods;
 }
 
 // Get the active profile from the redux state.
@@ -46,33 +62,124 @@ const getActiveGameId = (state: IState): string => {
   return profile !== undefined ? profile.gameId : undefined;
 };
 
+// Get the profile whose enabled state we should record for a game. That's the active profile for the game we're
+// managing, or the last active profile for any other game. Returns undefined if the game has never had a profile
+const profileForGame = (state: IState, gameId: string): Profile => {
+  const profile = activeProfile(state);
+  if (profile !== undefined && profile.gameId === gameId) return profile;
+
+  const profileId = getSafe(
+    state,
+    ["settings", "profiles", "lastActiveProfile", gameId],
+    undefined,
+  );
+  if (profileId === undefined) return undefined;
+
+  return getSafe(state, ["persistent", "profiles", profileId], undefined);
+};
+
 // Transform the format of the mod from what's used internally in Vortex into what we want to store in the file
-const transformModFormat = (mod: IMod, activeProfile: Profile): Mod => ({
+// If we don't know the enabled state for the mod's game, leave it undefined so that restoring won't change it
+const transformModFormat = (
+  mod: IMod,
+  gameId: string,
+  profile: Profile,
+): Mod => ({
   name: mod.attributes.modName,
   game: mod.attributes.downloadGame,
   modId: mod.attributes.modId,
   fileId: mod.attributes.fileId,
   source: mod.attributes.source,
   enabled:
-    !!activeProfile.modState &&
-    activeProfile.modState[mod.id]?.enabled === true,
+    profile !== undefined && profile.modState !== undefined
+      ? profile.modState[mod.id]?.enabled === true
+      : undefined,
   vortexId: mod.id,
+  installedGame: gameId,
 });
 
 /*
  * The installed mods will come back in an object format for games, where as we want an array, so do the following:
- *    Get the values of those objects
- *    Transform them into the structure we want
+ *    Get the entries of those objects, so we know which game each set of mods belongs to
+ *    Transform them into the structure we want, using that game's profile for the enabled state
  *    We now have data in structure Mod[][], so let's concat all the array's into one array
  */
-const getInstalledMods = (state: IState): Mod[] => {
-  const profile = activeProfile(state);
-
-  return Object.values(state.persistent.mods)
-    .map((game) =>
-      Object.values(game).map((mod) => transformModFormat(mod, profile)),
-    )
+const getInstalledMods = (state: IState): Mod[] =>
+  Object.entries(state.persistent.mods)
+    .map(([gameId, game]) => {
+      const profile = profileForGame(state, gameId);
+      return Object.values(game).map((mod) =>
+        transformModFormat(mod, gameId, profile),
+      );
+    })
     .reduce((result, current) => result.concat(current), []);
+
+// Replace characters that aren't allowed in Windows file names, so a profile name like "Main: Survival" still
+// makes a valid default file name
+const fileNamePart = (name: string): string =>
+  name.trim().replace(/[\\/:*?"<>|\x00-\x1f\s]+/g, "_") || "unnamed";
+
+// The local time as YYYYMMDD-HHMMSS, so backups sort by when they were made
+const fileNameTimestamp = (date: Date = new Date()): string => {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-` +
+    `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+  );
+};
+
+// The default file name for a backup, saying what was backed up and when:
+//    vortex-allgames-modlist-backup-<timestamp>.json for all games
+//    vortex-<game>-modlist-backup-<timestamp>.json for the game being managed
+//    vortex-<game>-<profile>-modlist-backup-<timestamp>.json for the active profile
+const defaultBackupFileName = (
+  state: IState,
+  thisGameOnly: boolean,
+  thisProfileOnly: boolean,
+): string => {
+  let scope = "allgames";
+  if (thisGameOnly) {
+    const profile = activeProfile(state);
+    scope = fileNamePart(profile.gameId);
+    if (thisProfileOnly) scope += `-${fileNamePart(profile.name ?? profile.id)}`;
+  }
+  return `vortex-${scope}-modlist-backup-${fileNameTimestamp()}.json`;
+};
+
+// The load order backup goes next to the modlist backup, with "modlist" swapped for "loadorder" in the name:
+//    vortex-starfield-Default-modlist-backup-<timestamp>.json -> vortex-starfield-Default-loadorder-backup-<timestamp>.json
+// If the user picked a name without "modlist-backup" in it, add "-loadorder" to the end instead
+const loadOrderFileName = (backupPath: string): string => {
+  const dir = path.dirname(backupPath);
+  const ext = path.extname(backupPath);
+  const base = path.basename(backupPath, ext);
+  const name = /modlist-backup/i.test(base)
+    ? base.replace(/modlist-backup/i, "loadorder-backup")
+    : `${base}-loadorder`;
+  return path.join(dir, `${name}${ext || ".json"}`);
+};
+
+// Write a JSON file in pretty-print for user readability. We write to a temporary file first and then rename it
+// over the backup, so that a crash part way through the write can't leave a half written backup
+const writeJsonFile = (
+  filePath: string,
+  data: string,
+  callback: (error?: Error) => void,
+) => {
+  const tempPath = `${filePath}.tmp`;
+  const onError = (error: Error) => {
+    fs.unlink(tempPath, () => undefined);
+    callback(error);
+  };
+
+  fs.writeFile(tempPath, data, (error: Error) => {
+    if (error) return onError(error);
+
+    fs.rename(tempPath, filePath, (error: Error) => {
+      if (error) return onError(error);
+      callback();
+    });
+  });
 };
 
 const init = (context: IExtensionContext) => {
@@ -85,7 +192,7 @@ const init = (context: IExtensionContext) => {
 
   context.registerAPI(
     "addSourceToModlistBackup",
-    (source: string, installMods: (api: IExtensionApi, mod: Mod[]) => void) => {
+    (source: string, installMods: InstallMods) => {
       console.log("Source being registered", source);
 
       if (integrations.some((existing) => existing.source == source)) return;
@@ -98,19 +205,110 @@ const init = (context: IExtensionContext) => {
     {},
   );
 
+  // Save the active profile's load order next to its modlist backup. This is the same data, in the same format, as
+  // the Export button on Vortex's Load Order page, so the file can be restored with that page's Import button.
+  // Games that use their own plugin list instead of Vortex's load order page don't have one, so we say so instead
+  const backupLoadOrder = (state: IState, backupPath: string) => {
+    const profile = activeProfile(state);
+    const loadOrder = getSafe(
+      state,
+      ["persistent", "loadOrder", profile.id],
+      undefined,
+    );
+
+    if (!Array.isArray(loadOrder) || loadOrder.length === 0) {
+      api.sendNotification({
+        type: "warning",
+        title: "Backup Complete",
+        message: `Modlist backed up to ${backupPath}. This profile has no load order to back up`,
+      });
+      return;
+    }
+
+    const loadOrderPath = loadOrderFileName(backupPath);
+
+    // Like the modlist, don't overwrite a file that isn't a load order backup
+    if (fs.existsSync(loadOrderPath)) {
+      let existing;
+      try {
+        existing = JSON.parse(fs.readFileSync(loadOrderPath));
+      } catch (error) {
+        existing = undefined;
+      }
+
+      if (!Array.isArray(existing)) {
+        api.showErrorNotification(
+          "Load order not saved",
+          `Modlist backed up to ${backupPath}, but ${loadOrderPath} already exists and isn't a load order backup, so it wasn't overwritten`,
+          { allowReport: false },
+        );
+        return;
+      }
+    }
+
+    writeJsonFile(
+      loadOrderPath,
+      JSON.stringify(loadOrder, null, 2),
+      (error) => {
+        if (error) {
+          api.showErrorNotification(
+            "Failed to save load order backup",
+            `Modlist backed up to ${backupPath}, but the load order couldn't be saved: ${error}`,
+          );
+          return;
+        }
+
+        api.sendNotification({
+          type: "success",
+          title: "Backup Complete",
+          message: `Modlist backed up to ${backupPath} and load order (${loadOrder.length} plugins) backed up to ${loadOrderPath}`,
+        });
+      },
+    );
+  };
+
   const backupMods = (
     thisGameOnly: boolean = false,
     thisProfileOnly: boolean = false,
   ) => {
     return () => {
       const state = api.store.getState();
+      const activeGameId = getActiveGameId(state);
+
+      if (thisGameOnly && activeGameId === undefined) {
+        api.showErrorNotification(
+          "No game is being managed",
+          "Select a game to manage before backing up its mods",
+          { allowReport: false },
+        );
+        return;
+      }
+
       let mods = getInstalledMods(state);
 
-      // Ask the user where they want to export to
-      api
-        .selectFile({ create: true, title: "Select file to export to" })
+      // Ask the user where they want to export to. The save dialog asks the user before replacing an existing file.
+      // Older versions of Vortex (and the vortex-api types we build against) don't have saveFile, so fall back to
+      // the open dialog there
+      const title = "Select file to export to";
+      const selectBackupFile: Promise<string> =
+        typeof (api as any).saveFile === "function"
+          ? (api as any).saveFile({
+              title,
+              defaultPath: defaultBackupFileName(
+                state,
+                thisGameOnly,
+                thisProfileOnly,
+              ),
+              filters: [
+                { name: "Modlist backup", extensions: ["json"] },
+                { name: "All files", extensions: ["*"] },
+              ],
+            })
+          : api.selectFile({ create: true, title });
+
+      selectBackupFile
         .then((fileName) => {
-          const activeGameId = getActiveGameId(state);
+          if (!fileName) return;
 
           mods = mods
             // Some mods don't have modId's or fileId's. Maybe they were manually installed? Since we need a modId
@@ -119,48 +317,63 @@ const init = (context: IExtensionContext) => {
 
           // If we're only backing up the existing games, let's filter out other ones
           if (thisGameOnly) {
-            mods = mods.filter((mod) => mod.game === activeGameId);
+            mods = mods.filter((mod) => modGame(mod) === activeGameId);
           }
 
           if (thisProfileOnly) {
             mods = mods.filter((mod) => mod.enabled);
           }
 
-          // If we're overwriting an existing mod list, we only want to overwrite the mods for the game we're currently managing.
-          // We don't want to remove mods from the backup for games that aren't installed
+          // If the file already has content, make sure it's a modlist backup before we touch it, so that picking the
+          // wrong file doesn't overwrite it
+          let existingMods: Mod[] = [];
           if (fs.existsSync(fileName) && fs.readFileSync(fileName).length > 2) {
             try {
-              // Get mods from the backup that aren't from the active game
-              const existingMods = JSON.parse(fs.readFileSync(fileName)).filter(
-                (mod: Mod) => mod.game !== activeGameId,
-              );
-
-              mods = mods
-                // Only get mods from the currently managed game, then merge them with the existing list
-                .filter((mod: Mod) => mod.game === activeGameId)
-                .concat(existingMods);
+              existingMods = JSON.parse(fs.readFileSync(fileName));
             } catch (error) {
-              console.log(error);
+              existingMods = undefined;
+            }
+
+            if (!Array.isArray(existingMods)) {
+              api.showErrorNotification(
+                "Backup not saved",
+                `${path.resolve(
+                  fileName,
+                )} already exists and isn't a modlist backup, so it wasn't overwritten`,
+                { allowReport: false },
+              );
+              return;
             }
           }
 
-          // Write the file in pretty-print JSON for user readability
-          fs.writeFile(
-            path.resolve(fileName),
-            JSON.stringify(mods, null, 4),
-            (error) => {
-              if (error) {
-                api.showErrorNotification(error, error);
-                return;
-              }
+          // If we're backing up one game over an existing mod list, we only want to overwrite the mods for that game.
+          // We don't want to remove mods from the backup for other games. A backup of all games replaces the file
+          if (thisGameOnly) {
+            mods = mods.concat(
+              existingMods.filter(
+                (mod: Mod) => !!mod && modGame(mod) !== activeGameId,
+              ),
+            );
+          }
 
+          const backupPath = path.resolve(fileName);
+          writeJsonFile(backupPath, JSON.stringify(mods, null, 4), (error) => {
+            if (error) {
+              api.showErrorNotification("Failed to save modlist backup", error);
+              return;
+            }
+
+            if (!thisProfileOnly) {
               api.sendNotification({
                 type: "success",
                 title: "Backup Complete",
-                message: `Modlist backed up to ${path.resolve(fileName)}`,
+                message: `Modlist backed up to ${backupPath}`,
               });
-            },
-          );
+              return;
+            }
+
+            backupLoadOrder(state, backupPath);
+          });
         })
         .catch((error) => console.log(error));
     };
@@ -168,7 +381,6 @@ const init = (context: IExtensionContext) => {
 
   const restoreMods = () => {
     const state: IState = api.store.getState();
-    let shouldInstall = state.settings.automation.install;
     const doInstall = "Yes, download and install";
     const dontInstall = "No, download only";
 
@@ -185,21 +397,100 @@ const init = (context: IExtensionContext) => {
       return;
     }
 
+    // We don't want to restore for other games that might be in the modlist but aren't actively being managed
+    const activeGameId = getActiveGameId(state);
+
+    if (activeGameId === undefined) {
+      api.showErrorNotification(
+        "No game is being managed",
+        "Select a game to manage before restoring its mods",
+        { allowReport: false },
+      );
+      return;
+    }
+
     // Ask the user to select their file
     api
       .selectFile({ create: false, title: "Select your backup file to import" })
-      .then((fileName) => {
-        fs.readFile(path.resolve(fileName), async (error, jsonString) => {
-          // We don't want to restore for other games that might be in the modlist but aren't actively being managed
-          const activeGameId = getActiveGameId(state);
+      .then(async (fileName) => {
+        if (!fileName) return;
 
-          if (error) {
-            api.showErrorNotification(error, error);
-            return;
-          }
+        const backupPath = path.resolve(fileName);
+        let mods: Mod[];
 
-          shouldInstall =
-            state.settings.automation.install ||
+        try {
+          mods = JSON.parse(await fs.promises.readFile(backupPath));
+        } catch (error) {
+          mods = undefined;
+        }
+
+        if (!Array.isArray(mods)) {
+          api.showErrorNotification(
+            "Failed to read modlist backup",
+            `${backupPath} couldn't be read or isn't a modlist backup`,
+            { allowReport: false },
+          );
+          return;
+        }
+
+        mods = mods
+          // We only restore the mods for the current game that we're looking at
+          .filter((mod) => !!mod && modGame(mod) === activeGameId)
+          // The nexus installer only installs mods for the nexus source, so let's filter out other sources
+          // However, this mod predates that check, so we have a backwards compatibility for older backups
+          .map((mod) => {
+            if (!mod.source) {
+              mod.source = "nexus";
+            }
+
+            return mod;
+          })
+          .filter((mod) =>
+            integrations.some(({ source }) => mod.source === source),
+          );
+
+        const modsFound = mods.length;
+
+        // Only mods installed into the current game count, so that a mod installed for another game that shares
+        // its downloads still gets installed here
+        const installedMods = getInstalledMods(state).filter(
+          (mod) => mod.installedGame === activeGameId,
+        );
+
+        // Filter out any mods that aren't already installed. After this filter, we'll only have new mods
+        // This way we don't try to install mods twice
+        const modsToInstall = mods.filter(
+          (mod) =>
+            !installedMods.some(
+              // This will return true if the two mods (installedMod and mod) are the same
+              (installedMod) =>
+                installedMod.game === mod.game &&
+                installedMod.modId === mod.modId &&
+                installedMod.fileId === mod.fileId,
+            ),
+        );
+
+        // Get a list of all installed mods whose enabled state is different to what's in the backup so that we can set enabled state for the profile correctly
+        const modsToChangeState = mods
+          .filter((mod) => mod.enabled !== undefined)
+          .map(
+            (mod) =>
+              installedMods.filter(
+                // This will return true if the two mods (installedMod and mod) are the same
+                (installedMod) =>
+                  installedMod.game === mod.game &&
+                  installedMod.modId === mod.modId &&
+                  installedMod.fileId === mod.fileId &&
+                  installedMod.enabled !== undefined &&
+                  installedMod.enabled !== mod.enabled,
+              )[0],
+          )
+          .filter((mod) => !!mod);
+
+        // Only ask about installing if automatic installation is off and there's something new to install
+        const shouldInstall =
+          state.settings.automation.install ||
+          (modsToInstall.length > 0 &&
             (await api
               .showDialog(
                 "question",
@@ -216,142 +507,96 @@ const init = (context: IExtensionContext) => {
                   },
                 ],
               )
-              .then((result) => result?.action === doInstall));
+              .then((result) => result?.action === doInstall)));
 
-          let mods = JSON.parse(jsonString) as Mod[];
+        const installs: Record<string, Mod[]> = {};
 
-          mods = mods
-            // We only restore the mods for the current game that we're looking at
-            .filter((mod) => mod.game === activeGameId)
-            // The nexus installer only installs mods for the nexus source, so let's filter out other sources
-            // However, this mod predates that check, so we have a backwards compatibility for older backups
-            .map((mod) => {
-              if (!mod.source) {
-                mod.source = "nexus";
-              }
+        // `mod-update` is the Vortex internal event that's used for mod updates. Happily, it'll also download and install mods that aren't installed for us
+        for (const mod of modsToInstall) {
+          const integration = integrations.find(
+            ({ source }) => mod.source === source,
+          );
+          if (!integration) continue;
+          if (!installs[integration.source]) installs[integration.source] = [];
 
-              return mod;
-            })
-            .filter((mod) =>
-              integrations.some(({ source }) => mod.source === source),
-            );
+          installs[integration.source].push(mod);
+        }
 
-          const modsFound = mods.length;
-
-          const installedMods = getInstalledMods(state);
-
-          // Filter out any mods that aren't already installed. After this filter, we'll only have new mods
-          // This way we don't try to install mods twice
-          const modsToInstall = mods.filter(
-            (mod) =>
-              !installedMods.some(
-                // This will return true if the two mods (installedMod and mod) are the same
-                (installedMod) =>
-                  installedMod.game === mod.game &&
-                  installedMod.modId === mod.modId &&
-                  installedMod.fileId === mod.fileId,
-              ),
+        Object.keys(installs).forEach((installSource) => {
+          const integration = integrations.find(
+            ({ source }) => installSource === source,
           );
 
-          // Get a list of all installed mods whose enabled state is different to what's in the backup so that we can set enabled state for the profile correctly
-          const modsToChangeState = mods
-            .filter((mod) => mod.enabled !== undefined)
-            .map(
-              (mod) =>
-                installedMods.filter(
-                  // This will return true if the two mods (installedMod and mod) are the same
-                  (installedMod) =>
-                    installedMod.game === mod.game &&
-                    installedMod.modId === mod.modId &&
-                    installedMod.fileId === mod.fileId &&
-                    installedMod.enabled !== undefined &&
-                    installedMod.enabled !== mod.enabled,
-                )[0],
-            )
-            .filter((mod) => !!mod);
+          integration.installMods(api, installs[installSource], shouldInstall);
+        });
 
-          const installs: Record<string, Mod[]> = {};
-
-          // `mod-update` is the Vortex internal event that's used for mod updates. Happily, it'll also download and install mods that aren't installed for us
-          for (const mod of modsToInstall) {
-            const integration = integrations.find(
-              ({ source }) => mod.source === source,
-            );
-            if (!integration) continue;
-            if (!installs[integration.source])
-              installs[integration.source] = [];
-
-            installs[integration.source].push(mod);
-          }
-
-          Object.keys(installs).forEach((installSource) => {
-            const integration = integrations.find(
-              ({ source }) => installSource === source,
-            );
-
-            integration.installMods(api, installs[installSource]);
-          });
-
-          // Flip the enabled state for mods that aren't set correctly for this profile
-          modsToChangeState.forEach((mod) =>
-            api.store.dispatch(
-              actions.setModEnabled(
-                selectors.activeProfile(api.getState()).id,
-                mod.vortexId,
-                !mod.enabled,
-              ),
+        // Flip the enabled state for mods that aren't set correctly for this profile
+        modsToChangeState.forEach((mod) =>
+          api.store.dispatch(
+            actions.setModEnabled(
+              selectors.activeProfile(api.getState()).id,
+              mod.vortexId,
+              !mod.enabled,
             ),
-          );
+          ),
+        );
 
-          api.sendNotification({
-            type: "success",
-            title: `${modsToInstall.length} mods for ${activeGameId} restores`,
-            message: `${modsFound} mods found for ${activeGameId}, but only ${modsToInstall.length} mods installed`,
-          });
+        api.sendNotification({
+          type: "success",
+          title: `Modlist restored for ${activeGameId}`,
+          message: `${modsFound} mods found in the backup. ${
+            modsToInstall.length
+          } new mods queued for download${
+            shouldInstall ? " and install" : ""
+          }, ${
+            modsToChangeState.length
+          } enabled or disabled to match the backup`,
         });
       })
-      .catch((error) => console.log(error));
+      .catch((error) =>
+        api.showErrorNotification("Failed to restore modlist backup", error),
+      );
   };
 
   // Register our option to restore backups. We use `999` as our position to put this at the end of the menu list.
-  // Because we have the same position as the Modlist Backup option, they'll group together as a dropdown option
+  // Because we have the same position as the Back Up Modlist options, they'll group together as a dropdown option
   context.registerAction(
     "mod-icons",
     999,
-    "show",
+    "import",
     {},
-    "Modlist Backup: Restore",
+    "Restore Modlist",
     restoreMods,
   );
 
   // Register our option to backup mods. We use `999` as our position to put this at the end of the menu list.
-  // Because we have the same position as the Modlist Backup: Restore option, they'll group together as a dropdown option
+  // Because we have the same position as the Restore Modlist option, they'll group together as a dropdown option
   context.registerAction(
     "mod-icons",
     999,
-    "show",
+    "archive",
     {},
-    "Modlist Backup All Games",
+    "Back Up Modlist (All Games)",
     backupMods(),
   );
 
   // Register our option to backup mods from this game only. We use `999` as our position to put this at the end of the menu list.
-  // Because we have the same position as the Modlist Backup: Restore option, they'll group together as a dropdown option
+  // Because we have the same position as the Restore Modlist option, they'll group together as a dropdown option
   context.registerAction(
     "mod-icons",
     999,
-    "show",
+    "game",
     {},
-    "Modlist Backup Only This Game",
+    "Back Up Modlist (This Game)",
     backupMods(true),
   );
 
   context.registerAction(
     "mod-icons",
     999,
-    "show",
+    "profile",
     {},
-    "Modlist Backup Only This Profile",
+    "Back Up Modlist and Load Order (This Profile)",
     backupMods(true, true),
   );
 };
