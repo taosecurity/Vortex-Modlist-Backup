@@ -1,5 +1,12 @@
 ## Changelog
 
+#### Version 0.5.1
+ * Renamed to "Modlist and Load Order Backup", and the toolbar buttons are now Restore Modlist, Back Up Modlist (All Games), Back Up Modlist (This Game) and Back Up Modlist and Load Order (This Profile)
+ * Backing up "Only This Profile" also saves the profile's load order to a second file next to the modlist, like vortex-starfield-Default-loadorder-backup-20261026-212500.json. It's the same format as the Export button on Vortex's Load Order page, so you can restore it with that page's Import button
+ * Each toolbar button now has its own icon, instead of all four showing the same eye icon
+ * Backups now default to a file name saying what was backed up and when, like vortex-starfield-modlist-backup-20261026-212500.json
+ * Fixed installing in current versions of Vortex, which rejected the extension because of how its author was listed
+
 #### Version 0.5.0
  * Backing up all games over an existing backup now replaces it, instead of only updating the game you're managing
  * Backups now record whether mods are enabled using each game's own profile, so restoring a game no longer disables mods that were backed up while managing a different game

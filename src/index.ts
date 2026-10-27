@@ -32,6 +32,7 @@ const modGame = (mod: Mod): string => mod.installedGame ?? mod.game;
 interface Profile {
   gameId: string;
   id: string;
+  name?: string;
   lastActivated: number;
   modState?: Record<string, { enabled: boolean }>;
 }
@@ -113,6 +114,74 @@ const getInstalledMods = (state: IState): Mod[] =>
     })
     .reduce((result, current) => result.concat(current), []);
 
+// Replace characters that aren't allowed in Windows file names, so a profile name like "Main: Survival" still
+// makes a valid default file name
+const fileNamePart = (name: string): string =>
+  name.trim().replace(/[\\/:*?"<>|\x00-\x1f\s]+/g, "_") || "unnamed";
+
+// The local time as YYYYMMDD-HHMMSS, so backups sort by when they were made
+const fileNameTimestamp = (date: Date = new Date()): string => {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-` +
+    `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+  );
+};
+
+// The default file name for a backup, saying what was backed up and when:
+//    vortex-allgames-modlist-backup-<timestamp>.json for all games
+//    vortex-<game>-modlist-backup-<timestamp>.json for the game being managed
+//    vortex-<game>-<profile>-modlist-backup-<timestamp>.json for the active profile
+const defaultBackupFileName = (
+  state: IState,
+  thisGameOnly: boolean,
+  thisProfileOnly: boolean,
+): string => {
+  let scope = "allgames";
+  if (thisGameOnly) {
+    const profile = activeProfile(state);
+    scope = fileNamePart(profile.gameId);
+    if (thisProfileOnly) scope += `-${fileNamePart(profile.name ?? profile.id)}`;
+  }
+  return `vortex-${scope}-modlist-backup-${fileNameTimestamp()}.json`;
+};
+
+// The load order backup goes next to the modlist backup, with "modlist" swapped for "loadorder" in the name:
+//    vortex-starfield-Default-modlist-backup-<timestamp>.json -> vortex-starfield-Default-loadorder-backup-<timestamp>.json
+// If the user picked a name without "modlist-backup" in it, add "-loadorder" to the end instead
+const loadOrderFileName = (backupPath: string): string => {
+  const dir = path.dirname(backupPath);
+  const ext = path.extname(backupPath);
+  const base = path.basename(backupPath, ext);
+  const name = /modlist-backup/i.test(base)
+    ? base.replace(/modlist-backup/i, "loadorder-backup")
+    : `${base}-loadorder`;
+  return path.join(dir, `${name}${ext || ".json"}`);
+};
+
+// Write a JSON file in pretty-print for user readability. We write to a temporary file first and then rename it
+// over the backup, so that a crash part way through the write can't leave a half written backup
+const writeJsonFile = (
+  filePath: string,
+  data: string,
+  callback: (error?: Error) => void,
+) => {
+  const tempPath = `${filePath}.tmp`;
+  const onError = (error: Error) => {
+    fs.unlink(tempPath, () => undefined);
+    callback(error);
+  };
+
+  fs.writeFile(tempPath, data, (error: Error) => {
+    if (error) return onError(error);
+
+    fs.rename(tempPath, filePath, (error: Error) => {
+      if (error) return onError(error);
+      callback();
+    });
+  });
+};
+
 const init = (context: IExtensionContext) => {
   const { api } = context;
   const integrations: Integration[] = [];
@@ -135,6 +204,68 @@ const init = (context: IExtensionContext) => {
     },
     {},
   );
+
+  // Save the active profile's load order next to its modlist backup. This is the same data, in the same format, as
+  // the Export button on Vortex's Load Order page, so the file can be restored with that page's Import button.
+  // Games that use their own plugin list instead of Vortex's load order page don't have one, so we say so instead
+  const backupLoadOrder = (state: IState, backupPath: string) => {
+    const profile = activeProfile(state);
+    const loadOrder = getSafe(
+      state,
+      ["persistent", "loadOrder", profile.id],
+      undefined,
+    );
+
+    if (!Array.isArray(loadOrder) || loadOrder.length === 0) {
+      api.sendNotification({
+        type: "warning",
+        title: "Backup Complete",
+        message: `Modlist backed up to ${backupPath}. This profile has no load order to back up`,
+      });
+      return;
+    }
+
+    const loadOrderPath = loadOrderFileName(backupPath);
+
+    // Like the modlist, don't overwrite a file that isn't a load order backup
+    if (fs.existsSync(loadOrderPath)) {
+      let existing;
+      try {
+        existing = JSON.parse(fs.readFileSync(loadOrderPath));
+      } catch (error) {
+        existing = undefined;
+      }
+
+      if (!Array.isArray(existing)) {
+        api.showErrorNotification(
+          "Load order not saved",
+          `Modlist backed up to ${backupPath}, but ${loadOrderPath} already exists and isn't a load order backup, so it wasn't overwritten`,
+          { allowReport: false },
+        );
+        return;
+      }
+    }
+
+    writeJsonFile(
+      loadOrderPath,
+      JSON.stringify(loadOrder, null, 2),
+      (error) => {
+        if (error) {
+          api.showErrorNotification(
+            "Failed to save load order backup",
+            `Modlist backed up to ${backupPath}, but the load order couldn't be saved: ${error}`,
+          );
+          return;
+        }
+
+        api.sendNotification({
+          type: "success",
+          title: "Backup Complete",
+          message: `Modlist backed up to ${backupPath} and load order (${loadOrder.length} plugins) backed up to ${loadOrderPath}`,
+        });
+      },
+    );
+  };
 
   const backupMods = (
     thisGameOnly: boolean = false,
@@ -163,7 +294,11 @@ const init = (context: IExtensionContext) => {
         typeof (api as any).saveFile === "function"
           ? (api as any).saveFile({
               title,
-              defaultPath: "modlist-backup.json",
+              defaultPath: defaultBackupFileName(
+                state,
+                thisGameOnly,
+                thisProfileOnly,
+              ),
               filters: [
                 { name: "Modlist backup", extensions: ["json"] },
                 { name: "All files", extensions: ["*"] },
@@ -221,27 +356,23 @@ const init = (context: IExtensionContext) => {
             );
           }
 
-          // Write the file in pretty-print JSON for user readability. We write to a temporary file first and then
-          // rename it over the backup, so that a crash part way through the write can't leave a half written backup
           const backupPath = path.resolve(fileName);
-          const tempPath = `${backupPath}.tmp`;
-          const onError = (error) => {
-            fs.unlink(tempPath, () => undefined);
-            api.showErrorNotification("Failed to save modlist backup", error);
-          };
+          writeJsonFile(backupPath, JSON.stringify(mods, null, 4), (error) => {
+            if (error) {
+              api.showErrorNotification("Failed to save modlist backup", error);
+              return;
+            }
 
-          fs.writeFile(tempPath, JSON.stringify(mods, null, 4), (error) => {
-            if (error) return onError(error);
-
-            fs.rename(tempPath, backupPath, (error) => {
-              if (error) return onError(error);
-
+            if (!thisProfileOnly) {
               api.sendNotification({
                 type: "success",
                 title: "Backup Complete",
                 message: `Modlist backed up to ${backupPath}`,
               });
-            });
+              return;
+            }
+
+            backupLoadOrder(state, backupPath);
           });
         })
         .catch((error) => console.log(error));
@@ -428,44 +559,44 @@ const init = (context: IExtensionContext) => {
   };
 
   // Register our option to restore backups. We use `999` as our position to put this at the end of the menu list.
-  // Because we have the same position as the Modlist Backup option, they'll group together as a dropdown option
+  // Because we have the same position as the Back Up Modlist options, they'll group together as a dropdown option
   context.registerAction(
     "mod-icons",
     999,
-    "show",
+    "import",
     {},
-    "Modlist Backup: Restore",
+    "Restore Modlist",
     restoreMods,
   );
 
   // Register our option to backup mods. We use `999` as our position to put this at the end of the menu list.
-  // Because we have the same position as the Modlist Backup: Restore option, they'll group together as a dropdown option
+  // Because we have the same position as the Restore Modlist option, they'll group together as a dropdown option
   context.registerAction(
     "mod-icons",
     999,
-    "show",
+    "archive",
     {},
-    "Modlist Backup All Games",
+    "Back Up Modlist (All Games)",
     backupMods(),
   );
 
   // Register our option to backup mods from this game only. We use `999` as our position to put this at the end of the menu list.
-  // Because we have the same position as the Modlist Backup: Restore option, they'll group together as a dropdown option
+  // Because we have the same position as the Restore Modlist option, they'll group together as a dropdown option
   context.registerAction(
     "mod-icons",
     999,
-    "show",
+    "game",
     {},
-    "Modlist Backup Only This Game",
+    "Back Up Modlist (This Game)",
     backupMods(true),
   );
 
   context.registerAction(
     "mod-icons",
     999,
-    "show",
+    "profile",
     {},
-    "Modlist Backup Only This Profile",
+    "Back Up Modlist and Load Order (This Profile)",
     backupMods(true, true),
   );
 };
