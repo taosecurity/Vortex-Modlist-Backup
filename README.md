@@ -49,6 +49,30 @@ checks which method the profile uses and saves that one.
 
 Games with neither page have no load order to back up. The modlist is still saved, and you'll get a warning instead.
 
+#### Automatic export (0.6.0)
+For people who have another tool (or person) check the load order before they play. Open **Automatic Export
+Settings** on the Mods page toolbar, tick "Export automatically after each deploy or load order change", and pick an
+export folder. From then on, about 10 seconds after each deploy or load order change (for example a LOOT sort), the
+extension writes three files for the active profile to that folder, all with the same timestamp:
+ * `vortex-starfield-Default-modlist-backup-20261107-140000.json` (as **Back Up Modlist and Load Order (This Profile)**)
+ * `vortex-starfield-Default-loadorder-backup-20261107-140000.json` (or `loadorder-classic`)
+ * `vortex-starfield-Default-plugins-20261107-140000.txt`, a copy of the game's plugins.txt (Starfield, Skyrim Special
+   Edition and Fallout 4)
+
+Nothing is written when all three would match the newest set already there. Older sets of the same profile are moved
+to an `old` folder inside the export folder (never deleted). **Export for Load Order Check Now** does the same on demand.
+It's off until you save the settings. The settings are kept in `%APPDATA%\Vortex\modlist-backup-auto-export.json`.
+
+#### Apply Recommended Load Order (0.6.0)
+On the Mods page and Load Order page toolbars. Set the "Recommended load order folder" in Automatic Export Settings.
+The button reads the newest `vortex-<game>-<profile>-loadorder-recommended-<timestamp>.json` in
+`<recommended folder>\<profile>\` (the Load Order page's Export format, reordered), lists the plugins that move, and
+sets the order only after you click Apply, the same as importing it on the Load Order page. It refuses when the
+installed or enabled plugins no longer match the file, says so when the order already matches, and asks "Apply
+anyway" when the file was made for an older export than the newest one in the export folder. If a `status.json` with
+the same timestamp sits next to the file, its `summary` is shown too. It works with the default (Load Order page)
+method only, not Classic.
+
 #### Does it backup Mod Configs, Dependencies Etc.
 No, only the list of mods and, for a profile, its load order.
 
@@ -75,3 +99,5 @@ download the mods automatically unless you're a premium member, since you need t
  * `corepack yarn@3.6.4 webpack`
  * Copy `info.json` into `dist/`
  * Pack `dist/index.js` and `dist/info.json` into a `.7z` with [7-Zip](https://www.7-zip.org/)
+ * Test: `node test/mock-vortex.js` runs the built `dist/index.js` against a mock Vortex (automatic export and Apply
+   Recommended Load Order; it writes only to a new folder in `%TEMP%`)

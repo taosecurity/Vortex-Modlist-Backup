@@ -1,5 +1,10 @@
 ## Changelog
 
+#### Version 0.6.0
+ * Automatic export (off until you turn it on in **Automatic Export Settings**): about 10 seconds after each deploy or load order change, the active profile's modlist, load order and a copy of plugins.txt are written to a folder you pick, all three with the same timestamp (`vortex-<game>-<profile>-plugins-<timestamp>.txt` for plugins.txt). Unchanged sets aren't written again, and older sets move to an `old` folder. **Export for Load Order Check Now** does it on demand
+ * **Apply Recommended Load Order** reads the newest `vortex-<game>-<profile>-loadorder-recommended-<timestamp>.json` from a folder you pick, shows which plugins move, and sets the Load Order page's order when you confirm. It refuses when the plugins no longer match, and asks first when the file is older than the newest export
+ * Log lines start with `[MLB]` in Vortex's log
+
 #### Version 0.5.4
  * Each mod in a backup now records `version` (the version Vortex shows) and `archive` (the file it was last installed from). Vortex keeps a mod's folder name (`vortexId`) and its old Nexus file ID when you install a newer archive over it, so before this a backup could show an old version for a mod you'd already updated. Both fields are for information only; Restore doesn't use them
 

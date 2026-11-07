@@ -7,6 +7,7 @@ import {
 import getSafe from "./getSafe";
 import { actions, selectors } from "vortex-api";
 import { registerNexusIntegration } from "./nexus-integration";
+import { registerHandoff } from "./handoff";
 
 const path = require("path");
 const fs = require("fs");
@@ -308,6 +309,33 @@ const classicLoadOrder = (state: IState): LoadOrderEntry[] => {
     });
 };
 
+// The active profile's load order, from whichever page it lives on, or undefined when it has none
+const profileLoadOrder = (
+  state: IState,
+): { text: string; entries: LoadOrderEntry[]; source: LoadOrderSource } | undefined => {
+  const profile = activeProfile(state);
+  if (profile === undefined) return undefined;
+  const source = loadOrderSource(state, profile);
+  const entries =
+    source === "classic"
+      ? classicLoadOrder(state)
+      : getSafe(state, ["persistent", "loadOrder", profile.id], undefined);
+  if (!Array.isArray(entries) || entries.length === 0) return undefined;
+  return { text: JSON.stringify(entries, null, 2), entries, source };
+};
+
+// The active profile's modlist backup, as "Back Up Modlist and Load Order (This Profile)" writes it to a new file:
+// the enabled mods of the game being managed
+const profileModlist = (state: IState): { text: string; gameId: string; profile: Profile } => {
+  const profile = activeProfile(state);
+  const gameId = profile?.gameId;
+  if (gameId === undefined) return { text: undefined, gameId, profile };
+  const mods = getInstalledMods(state, true).filter(
+    (mod) => (mod.source === LOCAL_SOURCE || mod.game) && modGame(mod) === gameId && mod.enabled,
+  );
+  return { text: JSON.stringify(mods, null, 4), gameId, profile };
+};
+
 // The load order backup goes next to the modlist backup, with "modlist" swapped for "loadorder" in the name:
 //    vortex-starfield-Default-modlist-backup-<timestamp>.json -> vortex-starfield-Default-loadorder-backup-<timestamp>.json
 // A Plugins page (Classic) load order gets "loadorder-classic" instead, because the Load Order page can't import it:
@@ -356,6 +384,15 @@ const init = (context: IExtensionContext) => {
 
   context.once(() => {
     registerNexusIntegration(api);
+  });
+
+  // Automatic export after each change, and Apply Recommended Load Order (see handoff.ts)
+  registerHandoff(context, {
+    profileModlist,
+    profileLoadOrder,
+    fileNamePart,
+    fileNameTimestamp: () => fileNameTimestamp(),
+    loadOrderFileName,
   });
 
   context.registerAPI(
