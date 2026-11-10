@@ -48,7 +48,7 @@ let state = {
   loadOrder: {},
   session: { plugins: { pluginList: {} } },
 };
-const listeners = { async: {}, state: [] };
+const listeners = { async: {}, state: [], events: {} };
 const setLoadOrder = (profileId, order) => {
   state = { ...state, persistent: { ...state.persistent, loadOrder: { ...state.persistent.loadOrder, [profileId]: order } } };
   listeners.state.filter((l) => l.path.join(".") === "persistent.loadOrder").forEach((l) => l.cb());
@@ -87,7 +87,7 @@ const api = {
   },
   sendNotification: (n) => notes.push(`${n.type}: ${n.title}: ${n.message}`),
   showErrorNotification: (t, m) => notes.push(`error: ${t}: ${m}`),
-  events: { emit: () => undefined, on: () => undefined },
+  events: { emit: () => undefined, on: (name, cb) => { listeners.events[name] = cb; } },
   ext: { addSourceToModlistBackup: () => undefined },
   selectFile: () => Promise.resolve(undefined),
 };
@@ -187,6 +187,41 @@ const act = (title, group = "mod-icons") => actionsByTitle[`${group}|${title}`].
   await act("Apply Recommended Load Order");
   d = dialogs[dialogs.length - 1];
   check(d.title === "Recommended load order is out of date" && /C\.esm/.test(d.content.message) && /D\.esm/.test(d.content.message), "plugin set differs: refused, names both sides");
+
+  // 11-14 (0.6.1): an export waits until plugins.txt matches the profile (stale copy after a profile switch)
+  const stale = "# test\r\n*X.esm\r\n*Y.esm\r\n";
+  const before = files().join();
+  check(typeof listeners.events["profile-did-change"] === "function", "profile switch listener registered");
+  await sleep(1100);
+  fs.writeFileSync(pluginsTxt, stale);
+  setLoadOrder("p1", lo(["Starfield.esm", "C.esm", "A.esm", "B.esm"]));
+  flush(); // debounced export runs: plugins.txt is the previous profile's
+  check(files().join() === before && timers.length === 1, "stale plugins.txt: nothing written, a retry is scheduled");
+  check(logs.some((l) => /doesn't match this profile \(2 enabled there.*3 enabled in the profile/.test(l)), "log names the mismatch");
+  // matches now (lower case, and without the locked Starfield.esm, as Vortex writes it)
+  fs.writeFileSync(pluginsTxt, "# test\r\n*c.esm\r\n*a.esm\r\n*b.esm\r\n");
+  flush(); // the retry: plugins.txt now matches
+  f = files();
+  const stamp3 = (f[0] || "").match(/(\d{8}-\d{6})/)?.[1];
+  check(f.length === 3 && f.join() !== before && fs.readFileSync(path.join(exportDir, `vortex-starfield-Default-plugins-${stamp3}.txt`), "utf8").includes("*c.esm"),
+    "once plugins.txt matches (case and locked base game ignored), one set is written");
+  check(notes[notes.length - 1].startsWith("success: Exported"), "matching export: success notification");
+
+  // 13. Still stale after the wait: written anyway, with a warning
+  await sleep(1100);
+  fs.writeFileSync(pluginsTxt, stale);
+  listeners.events["profile-did-change"]("p1");
+  for (let i = 0; i <= 13 && timers.length > 0; i++) flush(); // debounce + 12 retries
+  f = files();
+  check(f.length === 3 && !f[0].includes(stamp3) && timers.length === 0, "after 12 retries the set is written anyway");
+  check(/^warning: Exported.*Warning: plugins\.txt doesn't match this profile/.test(notes[notes.length - 1]), "... with a warning notification");
+
+  // 14. Manual export with a mismatch: written at once, with the warning
+  await sleep(1100);
+  fs.writeFileSync(pluginsTxt, "# test\r\n*Z.esm\r\n");
+  const stamp4 = (files()[0] || "").match(/(\d{8}-\d{6})/)?.[1];
+  act("Export for Load Order Check Now");
+  check(!files()[0].includes(stamp4) && /^warning: Exported.*doesn't match/.test(notes[notes.length - 1]), "manual export with a mismatch: written, with a warning");
 
   // 10. Classic method: refuse
   state.settings.starfield.loadOrderManagementType.p1 = "gamebryo";

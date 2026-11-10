@@ -63,6 +63,12 @@ Nothing is written when all three would match the newest set already there. Olde
 to an `old` folder inside the export folder (never deleted). **Export for Load Order Check Now** does the same on demand.
 It's off until you save the settings. The settings are kept in `%APPDATA%\Vortex\modlist-backup-auto-export.json`.
 
+Since 0.6.1 an automatic export waits until plugins.txt lists exactly the profile's enabled plugins (the game's own
+plugins don't count). Right after you switch profiles, Vortex rewrites plugins.txt a little later than the rest, so
+without this wait the new profile's set could hold the previous profile's plugins.txt. It checks every 5 seconds for up
+to a minute; if plugins.txt still doesn't match, it writes the set anyway and shows a warning (deploy to refresh
+plugins.txt). **Export for Load Order Check Now** doesn't wait, but shows the same warning.
+
 #### Apply Recommended Load Order (0.6.0)
 On the Mods page and Load Order page toolbars. Set the "Recommended load order folder" in Automatic Export Settings.
 The button reads the newest `vortex-<game>-<profile>-loadorder-recommended-<timestamp>.json` in

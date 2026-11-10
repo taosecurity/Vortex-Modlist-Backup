@@ -42,7 +42,40 @@ interface Settings {
 }
 
 const DEBOUNCE_MS = 10000;
+// After a profile switch Vortex updates its load order state at once but rewrites plugins.txt a little later, so an
+// export can catch the previous profile's plugins.txt. An automatic export waits (retrying) until plugins.txt matches
+// the profile, for up to RETRY_MS * MAX_TRIES, then exports anyway with a warning (0.6.1).
+const RETRY_MS = 5000;
+const MAX_TRIES = 12;
 const PREFIX = "[MLB]";
+
+// Does plugins.txt list exactly the profile's enabled plugins? The game's own plugins (locked entries) are left out of
+// plugins.txt by Vortex, so they don't count. Names are compared without regard to case.
+export const pluginsMatch = (
+  entries: any[] | undefined,
+  pluginsText: string | undefined,
+): { ok: boolean; onlyInFile: string[]; onlyInProfile: string[] } => {
+  if (!Array.isArray(entries) || pluginsText === undefined) return { ok: true, onlyInFile: [], onlyInProfile: [] };
+  const profile = new Set(
+    entries
+      .filter((entry) => entry?.enabled === true && entry?.locked !== true)
+      .map((entry) => String(entry?.name ?? entry?.id ?? "").toLowerCase()),
+  );
+  const file = new Set(
+    pluginsText
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("*"))
+      .map((line) => line.slice(1).trim().toLowerCase()),
+  );
+  const onlyInFile = [...file].filter((name) => !profile.has(name));
+  const onlyInProfile = [...profile].filter((name) => !file.has(name));
+  return { ok: onlyInFile.length === 0 && onlyInProfile.length === 0, onlyInFile, onlyInProfile };
+};
+
+const mismatchText = (check: { onlyInFile: string[]; onlyInProfile: string[] }) =>
+  `plugins.txt doesn't match this profile (${check.onlyInFile.length} enabled there but not in the profile, ` +
+  `${check.onlyInProfile.length} enabled in the profile but not there); deploy in Vortex to refresh it`;
 
 // Where each supported game keeps plugins.txt, under %LOCALAPPDATA%
 const PLUGINS_TXT_DIR: Record<string, string> = {
@@ -149,7 +182,8 @@ export const registerHandoff = (context: IExtensionContext, helpers: HandoffHelp
   };
 
   // ---------- automatic export ----------
-  const exportNow = (reason: string, manual: boolean) => {
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  const exportNow = (reason: string, manual: boolean, attempt = 0) => {
     const settings = readSettings();
     if (!manual && !settings.enabled) return;
     if (!settings.folder || !fs.existsSync(settings.folder)) {
@@ -176,6 +210,23 @@ export const registerHandoff = (context: IExtensionContext, helpers: HandoffHelp
     const loadOrder = helpers.profileLoadOrder(state);
     const txtPath = pluginsTxtPath(modlist.gameId);
     const pluginsText = txtPath !== undefined ? readText(txtPath) : undefined;
+
+    // Wait for plugins.txt to belong to this profile (automatic exports only; a manual export goes ahead with a warning)
+    const check = pluginsMatch(loadOrder?.entries, pluginsText);
+    if (!check.ok && !manual && attempt < MAX_TRIES) {
+      log("debug", `${PREFIX} ${reason}: ${mismatchText(check)}; trying again in ${RETRY_MS / 1000} s (${attempt + 1}/${MAX_TRIES})`);
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        try {
+          exportNow("waiting for plugins.txt", false, attempt + 1);
+        } catch (error) {
+          log("error", `${PREFIX} automatic export failed: ${error}`);
+        }
+      }, RETRY_MS);
+      return;
+    }
+    if (!check.ok) log("warn", `${PREFIX} ${reason}: exporting anyway: ${mismatchText(check)}`);
 
     const gamePart = helpers.fileNamePart(modlist.gameId);
     const profilePart = helpers.fileNamePart(modlist.profile.name ?? modlist.profile.id);
@@ -246,14 +297,16 @@ export const registerHandoff = (context: IExtensionContext, helpers: HandoffHelp
       loadOrder === undefined ? "load order (this profile has none)" : undefined,
       pluginsText === undefined ? `plugins.txt (${txtPath ?? "not known for this game"})` : undefined,
     ].filter((part) => part !== undefined);
+    const warn = missing.length > 0 || !check.ok;
     log("info", `${PREFIX} ${reason}: exported ${written.map((file) => path.basename(file)).join(", ")}`);
     api.sendNotification({
-      type: missing.length > 0 ? "warning" : "success",
+      type: warn ? "warning" : "success",
       title: "Exported for a load order check",
       message:
         `${written.length} files (${stamp}) in ${settings.folder}` +
-        (missing.length > 0 ? `. Missing: ${missing.join(", ")}` : ""),
-      displayMS: missing.length > 0 ? undefined : 5000,
+        (missing.length > 0 ? `. Missing: ${missing.join(", ")}` : "") +
+        (!check.ok ? `. Warning: ${mismatchText(check)}` : ""),
+      displayMS: warn ? undefined : 5000,
     });
   };
 
@@ -261,6 +314,10 @@ export const registerHandoff = (context: IExtensionContext, helpers: HandoffHelp
   const scheduleExport = (reason: string) => {
     if (!readSettings().enabled) return;
     if (timer !== undefined) clearTimeout(timer);
+    if (retryTimer !== undefined) {
+      clearTimeout(retryTimer); // a new trigger starts the wait for plugins.txt over
+      retryTimer = undefined;
+    }
     timer = setTimeout(() => {
       timer = undefined;
       try {
@@ -519,6 +576,8 @@ export const registerHandoff = (context: IExtensionContext, helpers: HandoffHelp
     // Load Order page (default method) and Plugins page (Classic) changes, e.g. after a LOOT sort
     api.onStateChange(["persistent", "loadOrder"], () => scheduleExport("load order change"));
     api.onStateChange(["loadOrder"], () => scheduleExport("plugins page change"));
+    // A profile switch: export once its plugins.txt has been written (see pluginsMatch, 0.6.1)
+    api.events.on("profile-did-change", () => scheduleExport("profile switch"));
   });
 
   context.registerAction("mod-icons", 999, "settings", {}, "Automatic Export Settings", editSettings);
