@@ -6,7 +6,7 @@
   "repository": "",
   "license": "MIT",
   "scripts": {
-    "bundle7z": "7z a -t7z modlist-backup.7z ./dist/index.js ./dist/info.json",
+    "bundle7z": "7z a -t7z modlist-backup.7z ./dist/index.js ./dist/info.json ./LICENCE",
     "build": "yarn webpack && yarn extractInfo",
     "bundle": "yarn build && yarn bundle7z"
   },
